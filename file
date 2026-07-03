@@ -1,0 +1,372 @@
+# Helios + Reinforcement Learning: Where It Fits, How It Works, and Whether It Beats the Current Design
+
+> Companion to `architecture_review.md`. Scope: the four questions on RL for the bond recommendation engine (two-tower retrieval → multi-signal re-rank → compliance gate → blotter). Verdicts are decisive; hype is not.
+>
+> **Date**: 2026-06-30
+> **Method**: 4 parallel expert analyses (RL formulations/mechanics · hardware/infra · replace-vs-augment · compliance/offline-eval), each adversarially verified claim-by-claim, then synthesized.
+
+---
+
+## TL;DR Verdict
+
+- **Yes, RL helps — but narrowly.** The useful RL is a **contextual bandit**, and its home is the **Phase-2 α/β/γ weight-learning layer** (optionally a per-bond re-ranker later). It does **not** touch the two-tower retriever (that stays InfoNCE representation learning) and it is **not** full sequential/deep RL.
+- **Augment, do not replace.** The current architecture is sound and regulator-shaped. RL slots into exactly one seam: turning human-picked weights into a **context-aware, propensity-debiased, learned policy** that optimizes the *actual business outcome* (trades) instead of an embedding-similarity proxy.
+- **The one highest-leverage move:** an **offline-trained contextual bandit (Thompson Sampling) over α/β/γ**, learned off-policy with **IPS / doubly-robust evaluation**, deployed **shadow → constrained-online → A/B**, with the compliance gate strictly after ranking. This *is* the planned Phase 2.
+- **The honest caveat:** the blocker is **not GPU and not the algorithm** — it's **data plumbing and governance**. You cannot do any of this until you **log propensities + candidate sets** and inject **controlled exploration** (today's ranker is deterministic, so its propensities are degenerate 0/1 and IPS is undefined). That instrumentation + an OPE harness + best-execution-constrained exploration is the real, multi-month work.
+
+---
+
+## 1. Does RL Fit, and Where in the Stack?
+
+Map RL to the layers before arguing about algorithms. Conflating "RL" with "the whole recommender" is the core mistake to avoid in a design review or an interview.
+
+```
+                                   RL LIVES HERE (decision / explore-exploit)
+                                                  |
+[Two-Tower Retrieval] -> [Candidate set ~500-1000] -> [Re-Rank: a*s1 + b*s2 + c*s3] -> [Compliance Gate] -> Blotter
+  InfoNCE, NO RL            matmul + argsort           Phase 2: LEARN weights = BANDIT     5310/MiFID, HARD
+  (representation)          (recall)                   (decision / ranking)               (terminal filter)
+```
+
+| Layer | Job | Right tool | Does RL belong? |
+|---|---|---|---|
+| **Representation / Recall** | Compress 50K clients × catalog into a 128-d similarity space; pull top candidates from the active pool | Two-tower dual-encoder (symmetric InfoNCE) | **No.** Supervised metric learning. Sample-efficient, auditable, PoC-won. Embeddings become *features* (context) for the bandit. |
+| **Decision / Ranking + Exploration** | Given candidates + context, choose what to surface to maximize *trades*, while exploring under uncertainty | **Contextual bandit** (LinUCB / Thompson) | **Yes — this is the seam.** Phase-2 "learn α/β/γ" *is* a contextual-bandit problem. |
+| **Compliance gate** | Best-execution / suitability hard filter | Deterministic rule layer | **No.** RL produces a *proposal*; the gate is a hard mask downstream. This separation is what makes RL defensible. |
+
+**Why not RL in the retriever?** Not because RL *categorically* can't train an encoder — it can (YouTube's candidate generator uses top-K off-policy REINFORCE). It's that **here the marginal value is low and the risk is high**: ~50K interactions is far too little for stable, high-variance policy-gradient training of a 128-d encoder; the selection bias means there's no trustworthy reward to backprop (the correct fix for *that* bias is **IPS-weighted contrastive loss**, not RL); and best-execution favors an auditable, stable contrastive retriever feeding an inspectable deterministic re-ranker. Revisit reward-aware retriever fine-tuning only after large, propensity-logged volume and a compliance-defensible explainability story exist.
+
+**One nuance on "stateless":** bond recs *do* have weak state — firm inventory depletion, client portfolio/ladder construction, market non-stationarity (Fed cycle, sector rotation), BWIC dynamics. That state is **slow-moving and second-order**, so modeling the problem as a **single-step contextual bandit is the right first-order choice** — provided you use **non-stationary variants** (discounted / sliding-window) rather than vanilla stationary LinUCB. The no-long-horizon argument holds for the per-rec *conversion* metric; it would **not** hold for a future *inventory-offload-over-horizon* or *lifetime-client-value* objective, which would be genuinely sequential (and a far harder compliance story).
+
+---
+
+## 2. Which RL Algorithm(s) — Ranked by Fit
+
+| Rank | Technique | On/Offline | Fit for Helios | Verdict |
+|---|---|---|---|---|
+| **1** | **Off-Policy Evaluation** (IPS / SNIPS / Doubly-Robust) | offline | Evaluate a new ranker *from logged data* before any live exposure | **Do this first.** Unblocks everything; it's also the SR 11-7 validation evidence. |
+| **2** | **Contextual bandit** (LinUCB / Linear or Logistic Thompson) on α/β/γ | offline-via-OPE, then constrained-online | Learns context-conditioned weights; tiny action/param space; interpretable | **Primary recommended build = Phase 2.** |
+| **3** | **Per-bond bandit** (LinUCB / TS over candidates; context = client+bond embeddings + s1/s2/s3) | constrained-online | Re-orders within compliance-approved set; the classic news-rec bandit | **Phase 2.5**, once propensity logging + online plumbing exist. |
+| **4** | **Neural-Linear bandit** (Bayesian last layer / MC-dropout on a small MLP reward head) | offline train, CPU serve | Captures non-linear s1/s2/s3 × regime interactions | Only if linear **underfits**; start linear. |
+| **5** | **Conservative offline RL** (CQL / BCQ / IQL) | offline | Learn a ranking policy bounded to logged support | **Defer to Phase 3+**, contingent on 6–12 months of logged volume. Wrong altitude for a single-step problem now. |
+| **6** | **Full sequential / slate RL** (DQN, PPO, SlateQ) | online/offline | Long-horizon session optimization | **Reject now.** Over-engineered, unidentifiable at this scale, hard-to-impossible to defend under best-execution. |
+
+### 2.1 The load-bearing formulation: contextual bandit on the weights
+
+A contextual bandit is a **one-step MDP**: observe context `x`, pick action `a`, get reward `r`, update. No transitions, no discounting. That matches "show a rec, see what happens" exactly.
+
+- **Context `x`:** session/market features — client segment, sector regime, Fed-cycle indicator, time-of-day, blotter load, recency of last trade, BWIC-list size, plus the three signal scores s1/s2/s3. (NOT the 500 bonds individually for the weight-learning cast.)
+- **Action `a`:** a weight vector (α, β, γ), **discretized into a small arm set** (e.g. 8–20 profiles: "BWIC-heavy", "feedback-heavy", "similarity-heavy") for the first, interpretable version. A compliance officer can read "in regime X, weight BWIC higher."
+- **Reward `r`:** business outcome of the resulting slate — **trade-conversion as primary**, revenue as a *secondary, constrained* objective. **Not raw clicks** (cheap, gameable). See §6 for why this must encode best-execution, not raw conversion.
+
+> If you ever truly learn only **three global constants**, a full contextual bandit is overkill — a counterfactual/IPS-weighted regression suffices. The bandit earns its keep the moment the weights become **context-conditioned** (per regime/segment).
+
+### 2.2 How the explore-exploit update works, mechanically
+
+**LinUCB (optimism under uncertainty).** Assume `E[r | x,a] = x_aᵀθ`. Maintain per-arm `A_a = I` (d×d) and `b_a = 0` (d).
+- Score each action: `p_a = x_aᵀθ̂_a + c·sqrt(x_aᵀ A_a⁻¹ x_a)`, where `θ̂_a = A_a⁻¹ b_a`. The sqrt term is the **confidence width** — it inflates the score of under-explored actions.
+- Pick `argmax p_a`, observe `r`, update `A_a ← A_a + x_a x_aᵀ` ; `b_a ← b_a + r·x_a`.
+- `d` is tens-to-low-hundreds → `A_a⁻¹` via Sherman-Morrison rank-1 update, **O(d²)**, CPU, sub-millisecond.
+
+**Thompson Sampling (preferred for compliance).** Put a Gaussian posterior `N(θ̂_a, A_a⁻¹)` on each `θ`. Per request: sample `θ̃_a ~ posterior`, pick `argmax x_aᵀθ̃_a`, observe `r`, conjugate update. Exploration is **naturally bounded** by the posterior (no explicit bonus to tune), and you can clip it or only let TS reorder *within* compliance-approved bonds.
+
+> `A` here is an accumulated **covariance/Gram matrix** (sufficient statistics), not "parameters" — the learned parameter vector is O(d). Use a **shared-weight** model over a low-dim context, **not** a disjoint per-arm model over ~1000 churning bonds (statistically data-starved at 50K).
+
+### 2.3 Worked example — one bandit loop on a real bond rec
+
+```
+CONTEXT x (this blotter view):
+  client_segment = "regional insurer", sector_regime = "credit-spread widening",
+  fed_cycle = "hold", blotter_load = high, last_trade_recency = 2d,
+  BWIC_list_size = 40, s1=0.81 (emb sim), s2=0.66 (BWIC), s3=-0.10 (recent dislike)
+
+1. SAMPLE (Thompson): draw θ̃ from each arm's posterior. Arm "BWIC-heavy"
+   (a=0.3,b=0.6,c=0.1) scores highest given regime+high BWIC list -> SELECT it.
+   Record propensity pi(a|x) = prob this arm was sampled  <-- logged for IPS.
+
+2. RANK: final_score = 0.3*s1 + 0.6*s2 + 0.1*s3 over the ~500 active bonds; top-K.
+
+3. COMPLIANCE GATE (HARD): drop any bond failing best-ex/suitability. The bandit
+   only ever proposed; the gate is terminal. Surviving top-K -> blotter.
+
+4. OBSERVE reward (lagged): trader accepts bond #2 today; it trades T+1 at a price
+   competitive vs comparable bonds -> r = +1 (trade) with best-ex term satisfied.
+   Async attribution join links this outcome back to the exposure event.
+
+5. UPDATE the "BWIC-heavy" arm's posterior: A += x xᵀ, b += r x.
+   Next time this regime appears, that arm is slightly more favored.
+```
+
+The exploration that matters: when **arm uncertainty is high** (a new regime, a cold-start bond), TS occasionally samples a non-greedy arm — **but only reorders within the gate-approved set**, so a "worse" surfaced bond is still independently best-execution-defensible. That is the difference between shippable and an enforcement finding.
+
+### 2.4 The crux: online exploration is unsafe → offline / off-policy is the real first build
+
+You **cannot** randomly perturb real client recs to "explore" under FINRA 5310 / MiFID II. So the first deployment is **off-policy learning + off-policy evaluation from logged data**, not live exploration.
+
+**The blocker — your log is biased and deterministic.** Training data = analyst-PITCHED pairs only, **no propensities logged**, and the Phase-1 ranker is deterministic (fixed weights + argsort → propensities are degenerate 0/1 → **IPS is undefined / infinite-variance**). Naive learning just imitates the analyst's possibly-conflicted selection.
+
+**The safe path, in order:**
+1. **Instrument propensity + candidate-set logging AND inject controlled stochasticity** (epsilon / softmax / Thompson over the candidate set, within compliance limits, e.g. tie-break randomization among already-approved bonds). Logging alone is necessary but **not sufficient** — you need action-space overlap.
+2. **Off-policy *evaluation* before off-policy *learning*.** Estimate a new policy's value without deploying it:
+   - **IPS:** `V̂(π) = (1/n) Σ [π(aᵢ|xᵢ)/μ̂(aᵢ|xᵢ)]·rᵢ`. Clip weights (capped IPS).
+   - **SNIPS** (self-normalized): divide by the sum of weights — trades a little bias for large variance reduction; essential under severe selection bias.
+   - **Doubly-Robust:** IPS correction on top of a learned reward model `q̂(x,a)` (a GBT is fine). Unbiased if *either* propensities *or* the reward model is right; lower variance. **DR + self-normalization is the pragmatic default at 50K.**
+   - **Direct Method** (fitted reward model alone) can be estimated **today** with no propensities — useful as a directional diagnostic while you build logging.
+3. **Pessimism toward unsupported actions.** Keep the *intuition* of CQL/BCQ — for action regions the log barely covers (your cold-start bonds), **fall back to deterministic Phase-1 weights** — but do **not** reach for CQL/BCQ machinery itself; those are trajectory-RL Q-learning methods, the wrong altitude for a one-step bandit. This doubles as a cold-start guard.
+4. **Then shadow → constrained-online TS → A/B**, closing the online-eval gap.
+
+### 2.5 Why full sequential / slate RL is wrong now (the senior signal)
+
+Formal cast: state = (client, regime, what's shown this session, blotter context); action = the slate; reward = trades; transition = next view. SlateQ decomposes whole-slate Q under a user-choice model. **Reject it for now**, because:
+- **Data:** ~50K interactions with *sparse* trade rewards is far too thin for stable deep value learning. With no logged propensities the behavior policy is unknown and action support is truncated → off-policy value estimation is **high-variance and largely unidentifiable**, not merely "overfitting."
+- **Weak sequentiality:** the value (a trade) is largely a per-(client, bond, moment) decision; no strong long-horizon credit-assignment story justifies discounted multi-step returns. 30%/quarter bond turnover makes the "state space" non-stationary.
+- **Compliance:** a cumulative-reward black box that could learn to **offload inventory over a horizon** is hard-to-impossible to defend under best-execution — closer to a **disqualifier** than a weak story.
+
+This indictment **explicitly excludes** contextual bandits / horizon-1 off-policy learning — those avoid bootstrapping and long-horizon credit assignment, have tractable OPE, and are the correct near-term step. Naming SlateQ as the tempting-but-wrong option, and saying why, is the senior signal.
+
+---
+
+## 3. Requirements — Compute, GPU, and the Infra That Actually Dominates
+
+**Honest punchline up front: GPU is not your constraint. Data plumbing and governance are.** Anyone who answers this by sizing an A100 cluster has misunderstood the problem. The bandit layer runs in **microseconds on one CPU core**; the full request (candidate scoring + compliance gate) is **milliseconds**.
+
+### 3.1 Compute per approach
+
+| Approach | Training compute | Serving compute | Honest note |
+|---|---|---|---|
+| **Linear contextual bandit** (LinUCB / LinTS) on α/β/γ | **None.** `A` at d=128 is ~64KB; Sherman-Morrison O(d²) updates; folds into nightly retrain or updates incrementally | **None.** Cached-inverse matvec, microseconds on **one CPU core** — GPU kernel-launch overhead alone would be *slower* | **$0 incremental hardware.** Runs on cores you already pay for. |
+| **Neural-Linear bandit** (Bayesian last layer / small MLP reward head on frozen two-tower) | **One smallest-class GPU** (T4/L4/A10G, 16–24GB) for nightly train — minutes at 50K; CPU also works | **None.** Export ONNX, sub-ms on CPU | GPU is a *convenience*, not a requirement. Full NeuralUCB/Neural-TS need a p×p gradient-covariance inverse over all params → infeasible; that's why you restrict to the **last layer**. |
+| **Conservative offline RL** (CQL/BCQ/IQL) | One A10G / L4 / A100-40GB; hours not days; tiny heads on 128-d embeddings | None if distilled to ONNX | **Hardware is a non-issue; the methodology is the problem.** Skip this tier. |
+| **Existing two-tower retraining** | The GPU that's already in the plan | ONNX-on-CPU (already in plan) | Unchanged. |
+
+### 3.2 The non-GPU infra that is 80%+ of the build
+
+Off-policy learning and evaluation are **mathematically impossible** without these. Every item is non-GPU.
+
+| # | Net-new item | What it is | Why it's the real cost |
+|---|---|---|---|
+| 1 | **Propensity / exposure logging + injected exploration** | Log, per event: candidate set, action taken, `π_log(a|x)`, gate decision. AND add controlled randomization (today's ranker is deterministic) | The #1 prerequisite. No propensities → no IPS/DR. Cannot be retrofitted onto history. A trader-trust + compliance event, not a backend tweak. |
+| 2 | **Reward-attribution pipeline** | Async join of exposures → trades/feedback; defined attribution window; explicit negative-reward definition | Bond trades **lag** (execute hours-days later, settle T+1/T+2; often closed off-platform via voice/RFQ); a *non-trade* is ambiguous. The hardest, quietest risk. |
+| 3 | **Feature-store train/serve consistency** | Point-in-time-correct context (same regime features, same recency-decayed s3, no future-feedback leakage) | Train/serve skew silently destroys bandits and is invisible in offline metrics. |
+| 4 | **OPE harness** | IPS / SNIPS / DR estimators + reward model, as the offline safety gate | Lets you reject bad policies offline; produces the validation evidence for model risk. CPU batch job. |
+| 5 | **Shadow → A/B → online-KPI infra** | Shadow-mode toggle, controlled A/B, KPI dashboards (trade conversion, revenue/rec, accept/dismiss/ignore, diversity/Gini, novelty/% new bonds) | Closes the online-eval gap the review flagged. |
+| 6 | **Drift detector + retrain trigger** | PSI on features, reward-rate monitors, posterior decay/forgetting | 30%/quarter turnover + Fed/credit cycles mean a stale posterior degrades silently. |
+| 7 | **Model-risk / SR 11-7 governance** | Documented purpose, independent validation, change-control over a self-updating policy, audit trail | In a regulated bank this is frequently the **actual critical path**. |
+
+### 3.3 What Wells likely has vs. net-new
+
+- **Stated for this system:** Kafka, ONNX serving, model registry + promotion gate, nightly retraining.
+- **Likely at org level but unverified for Helios:** a point-in-time feature store, batch-GPU capacity, audit/lineage tooling. Don't assume desk-level availability.
+- **Net-new (none need a GPU):** propensity logging + injected exploration, reward attribution, OPE harness, shadow/A-B, drift detector, SR 11-7 governance of a learning policy.
+
+### Minimal vs. comfortable
+
+- **Minimal (ship Phase-2 LinUCB safely):** existing CPU serving box, **no GPU**; net-new = propensity-logging schema + Kafka events, reward-attribution batch join, IPS/SNIPS OPE script, shadow toggle, exploration constrained by the existing gate. Reuses Kafka / feature store / registry / ONNX / nightly retrain.
+- **Comfortable (room for neural bandit + rigorous OPE):** add **one shared T4/L4** (batch, nightly, <10% utilization), serving stays CPU/ONNX; add DR-OPE harness, automated A/B + KPI dashboards, drift detector, candidate-set logging.
+
+> **The real spend is engineer-months on the pipeline, not silicon.** Compute is the non-issue; safe online learning under regulation is the work.
+
+---
+
+## 4. Will RL Beat the Current System?
+
+**Augment — do not replace.** Decisively.
+
+### 4.1 Why a "pure RL recommender" is strictly worse
+- It would **relearn the representation** the two-tower gives for free — over the *same* 50K interactions but with RL's far worse sample efficiency.
+- It inherits the **identical selection bias** *minus* the clean offline supervised eval (Recall@K, MRR, nDCG) you currently have — you lose debuggability and gain nothing.
+- It's an **auditability disaster** under FINRA/MiFID II: a monolithic policy net choosing bonds is far harder to defend than a deterministic similarity score + an explicit, logged, rate-limited exploration policy.
+
+### 4.2 Where RL genuinely beats the greedy weighted-sum
+
+| Win | Mechanism | Gap it closes |
+|---|---|---|
+| **Direct objective vs proxy** | Bandit optimizes the actual reward (trade booked, best-ex-weighted) instead of hand-tuned weights on s1/s2/s3 | "Optimization target undecided" |
+| **Context-conditioned weights** | α/β/γ adapt by regime (a hiking cycle up-weights BWIC liquidity) instead of fixed constants | Static weights / drift-responsiveness |
+| **Cold-start via exploration** | UCB/TS spends impression budget on high-uncertainty arms, generating the history that fixes the embedding — breaks the "never shown → never learned" loop | Cold-start (the *only* mechanism in the design that structurally addresses it) |
+| **Breaking the bias loop** | Logged propensities enable IPS-corrected eval; exploration data is, by construction, less biased than analyst-pitched-only | Selection/logging bias |
+| **Diversity / novelty / anti-Gini** | Exploration raises share of novel + long-tail bonds | Diversity/Gini, % new bonds KPIs |
+
+> Caveat on the "only fix" framing: a bandit's exploration is the most *elegant single* mechanism for cold-start + bias + diversity jointly (their shared upstream cause is missing exploration data), but each also has an established non-bandit remedy — IPS/DR for bias, **content/metadata-fed warm-start embeddings** for cold-start, **MMR / DPP / submodular re-ranking** for diversity. The bandit complements these; it doesn't make them redundant.
+
+### 4.3 Where RL is worse or dangerous — push back here
+- **Sample inefficiency / unidentifiability** if scope creeps to deep/sequential RL at 50K sparse interactions. Bandits are the disciplined subset that works at this scale.
+- **Objective misspecification → best-execution violation.** If a firm-revenue/inventory-offload term enters the reward, the policy **will** learn to dump inventory on clients — and a *contextual* learned policy can express that bias **per-decision**, harder to detect than a fixed constant. (Note: RL doesn't *create* this conflict — it exists in the Phase-1 weighted sum too if any signal encodes inventory.)
+- **Attribution noise** (trades close late, off-platform). A mis-specified reward trains the wrong behavior regardless of compute.
+- **Ops burden** — logging, propensity capture, OPE, exploration monitoring, kill-switch. Don't take it on before shadow/A-B infra exists.
+
+### What to refuse outright
+- Deep RL / DQN / policy-gradient **slate** optimization over the catalog → over-engineered; reject.
+- Any reward with **direct firm-revenue / inventory-offload** terms → best-ex violation risk; reject.
+- RL anywhere **downstream of or in place of** the compliance gate → the gate is terminal; reject.
+- Replacing the two-tower with an **end-to-end RL recommender** → strictly worse; reject.
+
+---
+
+## 5. Concrete Sequenced Augmentation Plan
+
+Nothing is thrown away; each step layers onto the existing ONNX/Kafka spine, preserves the deterministic fallback, and closes a **named** gap from the architecture review.
+
+| Phase | What you build | Risk | Documented gap closed |
+|---|---|---|---|
+| **A — Prerequisite (NOT RL yet)** | **Propensity + candidate-set logging** + inject controlled stochasticity (tie-break randomization within gate-approved bonds). Log shown set, score, `π_log(a|x)`, gate decision, timestamped outcomes incl. best-ex inputs. | Lowest | **Selection/logging bias** (§4.2). Unlocks IPS and all later off-policy work. Cannot be retrofitted — **do this first.** |
+| **B — Lowest-risk RL: offline bandit in SHADOW** | Offline-trained contextual **Thompson Sampling** over α/β/γ; context = client/bond embeddings + regime + s1/s2/s3; reward = IPS/DR-corrected, best-ex-weighted trade/accept. Serve in **shadow** (log picks, surface nothing); compare to prod via DR-OPE. | Low (zero client exposure) | **Phase-2 weight learning** (§5.4) + proxy-objective gap. Beats greedy with no live risk. |
+| **C — Promote to bounded LIVE exploration** | Constrained TS over the active pool, **5–10% of impressions**, **strictly upstream of the gate**, rate-limited per client, hard fallback to deterministic ranking on anomaly. Exploration reorders **only within gate-approved bonds.** | Medium (bounded, kill-switched) | **Cold-start (§4.3) + diversity/novelty/Gini (§4.6) + online eval (§4.6).** Starts generating the unbiased data the system was starving for. |
+| **D — Drift trigger (after A–C prove out)** | Drift detector on the bandit's reward stream + retrain trigger; reward degradation by regime/sector is itself a drift signal; posterior decay for non-stationarity. | Low | **Drift detector / retraining trigger** (§4.4). Still no deep/sequential RL. |
+| **(Deferred) E — Neural-Linear / per-bond bandit** | Only if linear underfits the s1/s2/s3 × regime interactions, and only after online plumbing + volume exist. | — | Marginal accuracy; not a gap-closer. |
+
+---
+
+## 6. Compliance & Safety Reality
+
+This is where a regulated recommender quietly goes wrong. Treat this section as load-bearing, not boilerplate.
+
+**Best-execution is the binding constraint (FINRA 5310 / Reg BI / MiFID II).** Each recommendation must be defensible **at the time it's made**. The compliance gate (after ranking, before delivery — §4.5 of the review) is the **hard action mask** — it converts an "uninterpretable policy" into "a policy whose output space is provably constrained to compliance-approved bonds." That is the single most important governance lever.
+
+**Exploration risk — what's shippable.** Exploration means deliberately surfacing an uncertain bond. In a music app, harmless; in best-execution fixed income, a direct conflict ("we surfaced a worse bond because the model wanted to learn" is an enforcement-grade admission). **Never** run unconstrained epsilon-greedy/Thompson over the raw bond universe. The two acceptable forms:
+1. **Shadow-only exploration** — exploratory picks logged + scored, never shown to a client. Zero client risk.
+2. **Constrained exploration within the gate-approved set** — randomize only among bonds each independently best-ex-cleared. In this form exploration is **conflict-neutral**: the inventory-offload conflict is governed by the **reward design + candidate-set gate**, not by the exploration mechanism, and the logged randomization actually **improves** auditability and enables unbiased IPS.
+
+**Reward hacking is the make-or-break.** If `reward = trades` or `revenue`, you have literally pointed the optimizer at the firm-inventory-offload axis — and it will reward-hack into the FINRA 5310 conflict, invisibly in offline conversion metrics. The reward **must encode best-execution**:
+- Primary: **trade-conversion**, with a **client-interest term** — fill price vs best available comparable, a penalty for inventory-conflicted picks, a diversity/novelty term.
+- Distinguish **revenue/markup** (more directly conflicted) from **binary conversion**.
+- Best-ex is broader than price (5310 also weighs liquidity, market character, quote accessibility, suitability) — price-vs-comparables is the primary but **incomplete** proxy.
+- Enforce best-ex primarily as a **hard gate constraint**, with the client-interest reward term as **defense-in-depth** — a soft penalty alone can be numerically overridden by a strong conversion signal.
+
+**OPE as the validation discipline.** DR (self-normalized) OPE with **honest, wide confidence intervals** at 50K is your SR 11-7 independent-validation evidence. Severe selection bias makes IPS weights explode; SNIPS/DR + clipping is mandatory, and even then OPE on pitch-only logs is a **directional diagnostic**, not a trustworthy estimator, until exploration creates action-space overlap (a **positivity/identification** problem, not just wide CIs).
+
+**Model risk / SR 11-7.** Documented purpose, development evidence, independent validation (OPE results), ongoing monitoring (drift), clear owner, and change-control over a *self-updating* policy. Prefer **interpretable policy classes** (linear bandit over the existing α/β/γ) — no less auditable than hand-tuned weights, and far easier to validate than a live-exploring agent. Note CQL/BCQ's "stay near logged behavior" is a *statistical* property, **not regulatory compliance** — an in-distribution action can still be unsuitable, and conservatism inherits the log's conflicts.
+
+**What to log starting today** (makes RL viable in 6–12 months; skip it and no future GPU rescues you):
+1. The **full candidate set** per event, not just the shown bond.
+2. **Propensities** — probability each candidate was surfaced (and inject the randomization that makes them non-degenerate).
+3. **Action + context + timestamp** with stable join IDs.
+4. **Outcomes with attribution metadata** — accept/dismiss/ignore (dense), trade/no-trade (sparse), revenue, **plus best-ex inputs** (fill price, best comparable) so the reward can encode client-interest.
+5. **Gate decisions** — what was rejected and why, so the action space is reconstructable for audit and offline-RL bounding.
+
+---
+
+## 7. Interview Framing — the 30-Second Spoken Answer
+
+> *"Could you have used RL for Helios?"*
+
+"Yes, but precisely — and the precision is the point. RL doesn't belong in the two-tower retriever; that's contrastive representation learning and stays InfoNCE. Where RL fits is the **decision layer** — turning our hand-picked re-rank weights, α/β/γ, into a **contextual bandit** that learns context-conditioned weights against a trade-conversion reward instead of an embedding-similarity proxy. That's literally our planned Phase 2.
+
+The catch is regulatory: under FINRA 5310 best-execution you can't do live exploration on real client trades, so the real first build isn't online RL — it's **off-policy**. You log candidate sets and propensities, inject a little controlled randomization because today's ranker is deterministic, and use **doubly-robust off-policy evaluation** to vet a new policy from logged data before it ever touches a client. The bandit needs **no GPU** — it's microsecond CPU linear algebra; the actual cost is propensity logging, reward attribution, and the compliance gate as a hard mask.
+
+And I'd explicitly *not* reach for SlateQ or deep sequential RL — at fifty-thousand sparse, selection-biased interactions it's unidentifiable and impossible to defend to model risk. So the verdict is **augment, not replace**: bandit on the weights, off-policy first, gate stays terminal."
+
+*(The senior signal is naming SlateQ as the tempting-but-wrong option and explaining why — sparse trades, weak sequentiality, best-execution — rather than reaching for the most impressive-sounding algorithm.)*
+
+---
+
+## Appendix — One-line verdicts
+
+| Question | Verdict |
+|---|---|
+| Will RL help? | Yes — a **contextual bandit** at the re-rank/decision layer. Nothing deeper. |
+| Which algorithm? | **Off-policy eval (DR/SNIPS) first**, then **offline contextual Thompson Sampling** on α/β/γ. Defer CQL/BCQ; reject SlateQ/DQN. |
+| GPU / requirements? | **No GPU** for the bandit (CPU microseconds). The constraint is **propensity logging + reward attribution + OPE harness + compliance-gated exploration**. |
+| Beat or augment? | **Augment.** Pure RL replacement is strictly worse on sample efficiency, auditability, and offline eval. |
+
+---
+
+**End of analysis.** Companion to `architecture_review.md` — append, don't rewrite.
+
+---
+
+# UPDATE — 2026-06-30 — XGBoost Reframe: What a Working Tree Baseline Does to the RL Roadmap
+
+> Added after the user clarified: the team now has a **promising XGBoost baseline** (feature selection + labeling + scoring already done); the **neural two-tower is still early**. The prior conclusion (RL = contextual bandit at the re-rank layer, off-policy first, no GPU, augment-not-replace) **still holds** — but the XGBoost baseline *sharpens* the bandit's charter rather than shrinking it. Verified via a 3-angle adversarial workflow (modeling reframe · OPE/reward reuse · roadmap+compliance).
+
+## TL;DR
+
+- **XGBoost is the right-sized call.** At ~50K heterogeneous tabular rows, gradient-boosted trees beating neural nets is the *expected*, literature-backed result (Grinsztajn 2022; Shwartz-Ziv & Armon 2021). Ship it as the production ranker now; do **not** gate it on the two-tower. "Neural still early" is a non-issue for the *ranking* layer.
+- **It SUBSUMES the linear weight-learner.** XGBoost learns a non-linear, context-conditioned `f(s1, s2, s3, context)` that strictly dominates three learned scalars. Formally **retire** "Phase-2 = learn α/β/γ" as an objective. The bandit's job shrinks to what supervised learning structurally *cannot* do: **exploration beyond the analyst-pitched set, epistemic uncertainty for directed explore/exploit, and off-policy correction.**
+- **You're closer to OPE than you think.** The trained XGBoost relevance/conversion model *is* the q̂(x,a) regression component of the Direct Method — and the Direct-Method term inside Doubly-Robust. The "build a reward model" line item is largely done; what remains is plumbing (propensity + candidate-set logging) and a **reward-definition retarget to best-execution**, not a model build.
+- **Compliance win.** An interpretable deterministic tree ranker + **monotonic constraints** (best-ex as a *provable invariant*) + SHAP per-decision attributions is the most defensible stack you can put in front of model-risk for a regulated best-ex surface — far more so than a neural policy.
+
+## Where each model lives now
+
+| Layer | Owner | Job | Justification |
+|---|---|---|---|
+| **Retrieval / embedding** | Two-tower (InfoNCE) | Embeddings + cold-start + large-space retrieval (client ~50K, all-time catalog ~100K); manufactures `s1` as an XGBoost feature; widens the candidate set | Cold-start (30%/qtr turnover), representation learning, bidirectional retrieval — jobs trees **don't** do. *Not* "sub-linear ANN over the active pool": at 500–1000 active bonds XGBoost can brute-force-score the whole pool, so retrieval isn't the bottleneck — the tower's real value is `s1` + cold-start embeddings. |
+| **Ranking** | XGBoost | Learns the non-linear, context-conditioned combination of `s1`, `s2` (BWIC), `s3` (decayed feedback) + client/bond/regime context | Production scorer; replaces the linear blend; expected to win at this scale and stay the ranker for a long time. |
+| **Exploration + off-policy** | Contextual bandit | Thin policy wrapper on top of XGBoost scores: epistemic uncertainty → directed exploration, propensity logging, IPS/SNIPS/DR OPE, compliance mask | The residual supervised learning *cannot* supply. **Wrap-not-replace.** |
+
+### Does XGBoost subsume α·s1 + β·s2 + γ·s3? — split the claim by layer
+
+- **YES, as the scorer.** XGBoost learns a non-linear, interaction-aware, context-conditioned combination of the same signals. The linear weighted sum dies. Retire "the bandit learns α/β/γ" as a literal objective.
+- **NO, it does not obsolete the bandit.** The bandit's real role was never weight-learning — it was the **off-policy decision + de-biasing + counterfactual-evaluation** layer. Trained on analyst-pitched-only logs with no propensities, XGBoost *reproduces and amplifies* selection bias (closed-loop feedback collapse), optimizes whatever label it's given (reward-hacking if the label is "trade/revenue"), and does **zero** exploration.
+
+> **XGBoost = scoring/value model. Contextual bandit = thin policy wrapper (propensity logging, OPE, compliance mask, bounded exploration).** XGBoost additionally serves as the DR reward model — it *complements*, it doesn't replace.
+
+**Integration shape:** `policy = argmax over masked candidates of [ XGBoost_score + β · uncertainty_bonus ]`. XGBoost is the value backbone; the bandit is a thin, OPE-evaluable decision layer. The uncertainty term is the **last** increment, not a co-equal first step.
+
+## Trees vs neural at 50K tabular — why XGBoost likely wins now
+
+The two-tower being early is **not** a problem, because it was never supposed to win the *ranking* fight. Its job (recall, embeddings, asymmetric update cadence, cold-start warm-start) is one trees don't do. **Do not deprioritize the retriever on the strength of a tabular-ranking benchmark** — and do not re-litigate ranking with neural at this scale; that burns runway for no expected lift and risks regressing the working baseline.
+
+## The big reuse — XGBoost as the OPE reward model
+
+**The model you already built is the regression component of OPE.**
+
+- **Direct Method (ship now, no propensities):** `V_DM(π) = (1/n) Σ_i Σ_{a∈C_i} π(a|x_i)·q̂(x_i,a)`. `C_i` = logged candidate set per impression. Use today to A/B re-rank variants offline. **Caveat:** DM is **biased** on the analyst-pitched distribution → treat as **directional/relative** (valid for ranking XGBoost variants when bias is common-mode); absolute lift stays untrustworthy until DR.
+- **Doubly-Robust (after propensity logging):** `V_DR(π) = V_DM(π) + (1/n) Σ_i [π(a_i|x_i)/p_log(a_i|x_i)]·(r_i − q̂(x_i,a_i))`. Use **SNIPS / weight clipping** (clip ~10–20); report **effective sample size** `ESS=(Σw)²/Σw²` on every number — if ESS collapses the policy is off-support → route to shadow, don't trust the number.
+- **Two hard caveats a model-risk review WILL catch:** (1) **q̂ must be retargeted to the best-execution reward `r`, not conversion/trade**, and calibrated on r's scale (isotonic/Platt) — a conversion-only q̂ launders the inventory-offload reward-hack through a "rigorous" OPE harness. (2) **Cross-fit q̂ out-of-fold** — DR's double-robustness fails when q̂ and propensities come from the *same* biased logs.
+- **IPS-weighted training:** `sample_weight = π_target/p_log` (reduces to `1/p_log` only when target is uniform; a re-ranker usually wants the serving candidate-set distribution). Hard precondition: a reliable `p_log` — Helios never logged it, so fit a propensity model on pitching history; if pitching is driven by *unlogged* signals (verbal axes, relationship reads) unconfoundedness fails and IPS is biased regardless of clipping.
+- **Uncertainty for exploration (trees give none):** separate **probability calibration** (cheap post-hoc — isotonic/Platt) from **epistemic uncertainty** (the structural gap). Pragmatic pick = a conjugate **Bayesian-linear / linear-Thompson (or LinUCB) head on a *frozen* XGBoost extractor**. On `[s1,s2,s3]` the posterior mean *literally is* α/β/γ **with credible intervals** — the Phase-2 weight-learner reborn *with* uncertainty, CPU microseconds, model-agnostic, auditable. (NGBoost/quantile = wrong quantity for UCB/TS; conformal = complementary abstention gate, not a sampling distribution.)
+
+## The "promising results" trap — verify before you trust
+
+Promising offline NDCG/AUC on analyst-pitched logs is **evidence the model agrees with the logging policy — not evidence of online best-execution value**, and it is *silent* on never-pitched bonds (exactly the region any re-ranker shifts mass toward). This is a **logging-policy bias the XGBoost baseline already shares**, not a bandit-only risk. Four checks before trusting the baseline:
+
+| Check | What | Why |
+|---|---|---|
+| **Temporal validation** | Train-past / test-future, per-quarter — **not** random k-fold | 30%/qtr turnover + drift; random folds leak future-bond signal and overstate the baseline |
+| **Slice metrics** | AUC/NDCG/calibration on (a) cold/new bonds, (b) sparse-history clients, (c) **never-pitched** bonds | Headline metric is dominated by the well-covered pitched slice; the bandit operates on the thin slices |
+| **Calibration** | Reliability curve + ECE/Brier; isotonic/Platt | A q̂ used as a *value* (not just rank) must be calibrated or DM/DR arithmetic is silently biased |
+| **Propensity-weighted offline metric** | Recompute with IPS weights (weighted-AUC / SNIPS reward) | High headline NDCG but low propensity-weighted metric ⇒ model wins only on over-represented logged actions — the canonical selection-bias tell |
+
+Plus a **reward-definition audit**: confirm the label encodes best-execution (price improvement / BWIC-consistent fill), not raw trade/revenue, *before* it becomes q̂.
+
+**Disambiguate the baseline first — ask, don't predict.** "Different scoring approaches" + "labeling" most likely signals target/label definition + objective experimentation, which could be pointwise OR the pointwise→pairwise→listwise ladder. **Pointwise (`binary:logistic`) is at least as likely as listwise here** — the IPS/SNIPS/DR harness wants a calibrated `P(trade|·)`, not a relative listwise score; LambdaMART becomes natural only once graded relevance + query groups exist (usually later). Three questions: (1) what **objective** (`binary:logistic` vs `rank:pairwise` vs `rank:ndcg`, is `set_group` used)? (2) labels binary or graded, what defines a positive? (3) metric AUC/logloss (pointwise tell) vs NDCG@k/MAP@k (ranking tell) — and **is the output calibrated**?
+
+## Revised sequenced roadmap
+
+**Propensity/candidate logging is the true critical path** and is independent of which model produces the score.
+
+| Phase | Work | Gate to advance |
+|---|---|---|
+| **0 — NOW (parallel)** | **A:** XGBoost hardening — **monotonic constraints** on best-ex features (price improvement, liquidity/BWIC quality, axe alignment), wire **SHAP** into the blotter. **B:** Propensity + candidate-set logging (define a softened logging policy even for a deterministic ranker). | XGBoost passes **temporal** offline eval AND logging is live capturing candidate sets + propensities |
+| **1 — DR-OPE harness** | IPS → SNIPS → DR, reusing XGBoost as the DM/value component. Retarget reward to best-execution. Cross-fit q̂. | OPE validated: logged-A/B replay sanity, healthy ESS, CIs, support-coverage reported |
+| **2 — Shadow mode** | XGBoost scores live, logs what it *would* recommend vs incumbent. Measure online best-ex KPIs. | Shadow non-inferior/better on online best-ex KPIs; model-risk sign-off on SHAP + monotonic-constraint doc |
+| **3 — XGBoost live** | Deterministic ranker behind the **hard compliance gate**. **No exploration yet.** | — |
+| **4 — Bandit (additive, later)** | Thin contextual bandit on live XGBoost: a **bounded stochastic exploration policy** (Thompson/ε over gate-approved top-K). Off-policy first via the Phase-1 harness, then bounded rate-limited exploration. This stochastic layer also supplies the non-degenerate propensities OPE needs for overlap. | OPE shows the bandit beats deterministic XGBoost **with CI**; model-risk approves exploration bounds + logging |
+
+**Dataflow (compliance-critical):** `candidates → gate hard-mask → XGBoost score → bandit bounded perturbation (logged, rate-limited) → gate RE-ASSERTED → blotter`. The gate **brackets** exploration (mask first so the bandit explores only legal arms, re-assert last). The served action, the logged (action, propensity, candidate_set), and reward attribution must all reflect the **post-mask** distribution, or OPE is biased.
+
+**Neural two-tower** stays on its **own track** as a retrieval/candidate-generation upgrade judged by **recall@k**; it feeds better candidates into the *same* XGBoost ranker. It does **not** gate the bandit. Promote only when it beats the current retriever on recall@k.
+
+**What not to do:** (1) don't rush the two-tower to "look advanced"; (2) don't let offline metrics greenlight live deployment; (3) don't bolt a bandit on before propensity logging; (4) don't put exploration downstream of the compliance gate.
+
+## Compliance angle — the defensible pattern
+
+**Interpretable deterministic tree ranker + thin logged/rate-limited exploration + hard compliance gate.**
+
+| Control | Mechanism | Maps to |
+|---|---|---|
+| Conceptual soundness | SHAP per-decision + global importance answer "why was this bond ranked here" | SR 11-7 |
+| **Best-ex as model invariant** | **Monotonic constraints** — monotone in price improvement / liquidity quality ⇒ "a strictly better price never ranks lower, all else equal" is *provable, auditable, survives retraining* | The single strongest sentence in the model-risk doc |
+| Bounded exploration | Thin, logged, rate-limited, reversible; propensities logged for retrospective OPE | Auditability |
+| Hard compliance gate last | Suitability / restricted-list / best-ex can **never** be violated by the learner | FINRA 5310 / MiFID II |
+
+**Two load-bearing qualifications:** (1) the durable artifact is the **monotone constraint (a guarantee)**; SHAP is *supporting evidence* that can drift under feature correlation — get each constraint's **direction** right with a compliance partner (a wrong-signed constraint bakes a violation in as an "invariant"). (2) Monotonicity/SHAP defend the **scorer, not the bandit** — the invariant only transfers if the bandit's exploration is **sign-constrained**. Doc sentence: *"The scoring function is monotone in price-improvement and liquidity/BWIC quality by construction, AND the exploration policy is sign-constrained to preserve that monotonicity."* Also: ε-greedy is the **wrong** exploration shortcut — uniform exploration is harder to defend under best-ex than **uncertainty-directed** exploration.
+
+## Interview update (spoken, 2–3 sentences)
+
+> "We deliberately started with the right-sized model — a gradient-boosted tree ranker — because it's both strong on tabular fixed-income signals and far more defensible to model risk: SHAP gives per-recommendation explanations and monotonic constraints let us encode best-execution as a provable invariant, like 'a strictly better price never ranks lower.' The XGBoost model also doubles as the reward/value model for doubly-robust off-policy evaluation, so we're closer to a real OPE harness than a model-build away — the gating work is propensity logging and retargeting the reward to best-execution, not training. The RL piece is a deliberate *later* augmentation: a thin contextual bandit that adds uncertainty-directed exploration on top of the tree ranker, gated behind OPE because online exploration is unshippable under FINRA 5310 — and the neural retriever is a separate, parallel candidate-generation track that feeds the same ranker and doesn't block the bandit."
+
+---
+
+**End of XGBoost update.**
